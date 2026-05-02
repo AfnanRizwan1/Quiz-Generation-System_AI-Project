@@ -1,0 +1,14 @@
+# datasets
+data/raw/
+data/processed/
+
+# model files
+*.pkl
+
+# python cache
+__pycache__/
+*.pyc
+
+# virtual environment
+venv/
+.env
