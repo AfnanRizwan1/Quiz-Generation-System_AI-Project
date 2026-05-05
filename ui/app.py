@@ -266,6 +266,75 @@ html, body, [class*="css"] {
 }
 .fade-in { animation: fadeSlide 0.4s ease; }
 
+/* ── Startup loading screen ── */
+@keyframes spin {
+    0%   { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+@keyframes pulse-glow {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(14,165,233,0); }
+    50%       { box-shadow: 0 0 32px 8px rgba(14,165,233,0.25); }
+}
+@keyframes bar-fill {
+    0%   { width: 0%; }
+    20%  { width: 15%; }
+    40%  { width: 38%; }
+    60%  { width: 62%; }
+    80%  { width: 85%; }
+    100% { width: 100%; }
+}
+.splash-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 72vh;
+    text-align: center;
+    animation: fadeSlide 0.5s ease;
+}
+.splash-logo {
+    font-family: 'Playfair Display', serif;
+    font-size: 3rem;
+    font-weight: 600;
+    color: var(--teal);
+    letter-spacing: -1px;
+    margin-bottom: 6px;
+    animation: pulse-glow 2.4s ease-in-out infinite;
+}
+.splash-sub {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    margin-bottom: 3rem;
+    letter-spacing: 0.3px;
+}
+.splash-spinner {
+    width: 52px; height: 52px;
+    border: 3px solid rgba(14,165,233,0.15);
+    border-top-color: var(--teal);
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+    margin-bottom: 2rem;
+}
+.splash-bar-track {
+    width: 280px; height: 4px;
+    background: rgba(148,163,184,0.12);
+    border-radius: 2px;
+    overflow: hidden;
+    margin-bottom: 1.2rem;
+}
+.splash-bar-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--teal), #6366f1);
+    border-radius: 2px;
+    animation: bar-fill 3.5s ease-in-out forwards;
+}
+.splash-step {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    letter-spacing: 0.5px;
+}
+.splash-step strong { color: var(--teal); }
+
 /* ── Streamlit widget overrides ── */
 .stTextArea textarea, .stTextInput input {
     background: var(--navy-mid) !important;
@@ -386,6 +455,7 @@ def init_state():
         "quiz_ready":      False,
         "_race_all_qs":    [],
         "_race_q_idx":     0,
+        "models_loaded":   False,   # becomes True after startup loading completes
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -409,6 +479,26 @@ def load_models():
         return True, None
     except Exception as e:
         return False, str(e)
+
+
+def models_ready() -> bool:
+    """
+    Fast check — just looks at whether the required model files exist on disk.
+    Does NOT load anything. Used only to enable/disable buttons before the
+    user clicks them. Actual loading happens inside button handlers.
+    """
+    required = [
+        os.path.join("data", "processed", "tfidf_vectorizer.pkl"),
+        os.path.join("data", "processed", "dense_scaler.pkl"),
+        os.path.join("models", "model_b", "traditional", "distractor_ranker.pkl"),
+        os.path.join("models", "model_b", "traditional", "hint_scorer.pkl"),
+    ]
+    # At least one Model A verifier must exist
+    model_a_any = any(
+        os.path.exists(os.path.join("models", "model_a", "traditional", f"{n}.pkl"))
+        for n in ["soft_vote_ensemble", "logistic_regression"]
+    )
+    return model_a_any and all(os.path.exists(p) for p in required)
 
 
 @st.cache_data(show_spinner=False)
@@ -517,30 +607,65 @@ def nav_button(label, target, disabled=False):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# STARTUP LOADING GATE
+# Show a themed splash screen on first visit, load all models, then reveal UI.
+# ══════════════════════════════════════════════════════════════════════════════
+if not st.session_state.models_loaded:
+
+    # Render the splash
+    st.markdown("""
+    <div class="splash-wrap">
+        <div class="splash-logo">🧠 QuizGen AI</div>
+        <div class="splash-sub">
+            Intelligent Reading Comprehension &amp; Quiz Generation System<br>
+            NUCES &nbsp;·&nbsp; AI Lab &nbsp;·&nbsp; Spring 2026
+        </div>
+        <div class="splash-spinner"></div>
+        <div class="splash-bar-track">
+            <div class="splash-bar-fill"></div>
+        </div>
+        <div class="splash-step">Initialising models — <strong>please wait…</strong></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Do the actual loading (blocks here, but splash is already visible)
+    ok, err = load_models()
+    st.session_state.models_loaded = True
+    st.session_state._model_ok  = ok
+    st.session_state._model_err = err
+    st.rerun()   # re-render with full UI now that models are in cache
+
+    st.stop()    # prevent anything below from running on this render pass
+
+
+# Models are loaded — retrieve cached status
+_models_ok  = st.session_state.get("_model_ok",  True)
+_model_err  = st.session_state.get("_model_err", None)
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Render top chrome
 # ══════════════════════════════════════════════════════════════════════════════
 render_topbar()
 render_step_bar()
-
-models_ok, model_err = load_models()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SCREEN 1 — Article Input
 # ══════════════════════════════════════════════════════════════════════════════
 if st.session_state.screen == "input":
 
-    if not models_ok:
-        st.markdown(f"""
-        <div class="card" style="border-color:rgba(239,68,68,0.4);">
-            <div class="card-title" style="color:#ef4444;">⚠ Models Not Loaded</div>
-            <div class="card-body">
-                Run the following commands first, then refresh:<br><br>
-                <code>python src/preprocessing.py</code><br>
-                <code>python src/model_a_train.py</code><br>
-                <code>python src/model_b_train.py</code>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+    if not _models_ok:
+        st.markdown(
+            '<div class="card" style="border-color:rgba(239,68,68,0.4);">'
+            '<div class="card-title" style="color:#ef4444;">⚠ Models Not Loaded</div>'
+            '<div class="card-body">'
+            f'{"<p>" + str(_model_err) + "</p>" if _model_err else ""}'
+            'Run the following commands first, then restart the app:<br><br>'
+            '<code>python src/preprocessing.py</code><br>'
+            '<code>python src/model_a_train.py</code><br>'
+            '<code>python src/model_b_train.py</code>'
+            '</div></div>',
+            unsafe_allow_html=True,
+        )
 
     tab_race, tab_custom = st.tabs(["🎲  RACE Dataset", "✏️  Custom Article"])
 
@@ -557,7 +682,7 @@ if st.session_state.screen == "input":
         col_btn, col_info = st.columns([1, 2])
         with col_btn:
             if st.button("🎲  Load Random Sample", type="primary",
-                         use_container_width=True, disabled=not models_ok):
+                         use_container_width=True, disabled=not _models_ok):
                 sample_df = load_race_sample()
                 if sample_df is not None:
                     row = sample_df.sample(1).iloc[0]
@@ -633,7 +758,7 @@ if st.session_state.screen == "input":
 
             with col_gen:
                 if st.button("🚀  Generate Quiz", type="primary",
-                             use_container_width=True, disabled=not models_ok):
+                             use_container_width=True, disabled=not _models_ok):
                     with st.spinner("Running inference…"):
                         from src.inference import run_race_pipeline
                         result = run_race_pipeline(
@@ -658,7 +783,7 @@ if st.session_state.screen == "input":
                 # Tooltip text depends on whether more questions exist
                 regen_label = "🔄  Next Question" if n_qs > 1 else "🔄  New Question"
                 if st.button(regen_label, use_container_width=True,
-                             disabled=not models_ok):
+                             disabled=not _models_ok):
                     sample_df = load_race_sample()
                     if sample_df is not None:
                         all_qs = st.session_state.get("_race_all_qs", [])
@@ -730,7 +855,7 @@ if st.session_state.screen == "input":
 
         st.markdown('<div style="height:12px"></div>', unsafe_allow_html=True)
         if st.button("🚀  Generate Quiz", type="primary",
-                     use_container_width=True, disabled=not models_ok,
+                     use_container_width=True, disabled=not _models_ok,
                      key="gen_custom"):
             if not article_input.strip():
                 st.error("Please enter a reading passage.")
@@ -857,10 +982,55 @@ elif st.session_state.screen == "quiz":
 
                 st.markdown('<div style="height:14px"></div>', unsafe_allow_html=True)
                 if st.button("🔄  Try Another Question", use_container_width=True):
-                    st.session_state.screen = "input"
-                    st.session_state.quiz_ready = False
+                    sample_df = load_race_sample()
+
+                    if st.session_state.mode == "race" and sample_df is not None:
+                        all_qs = st.session_state.get("_race_all_qs", [])
+                        q_idx  = st.session_state.get("_race_q_idx", 0)
+
+                        if len(all_qs) > 1:
+                            # Cycle to next question on the same article
+                            new_idx = (q_idx + 1) % len(all_qs)
+                            new_row = all_qs[new_idx]
+                            st.session_state._race_q_idx = new_idx
+                        else:
+                            # Pick a different article entirely
+                            current_article = st.session_state.article
+                            candidates = sample_df[
+                                sample_df["article"] != current_article
+                            ]
+                            if candidates.empty:
+                                candidates = sample_df
+                            new_row_series = candidates.sample(1).iloc[0]
+                            new_row = new_row_series.to_dict()
+                            new_id  = new_row["id"]
+                            new_all = sample_df[
+                                sample_df["id"] == new_id
+                            ].reset_index(drop=True)
+                            st.session_state._race_all_qs = new_all.to_dict("records")
+                            st.session_state._race_q_idx  = 0
+                            st.session_state.article      = new_row["article"]
+
+                        st.session_state.question          = new_row["question"]
+                        st.session_state._race_options     = {
+                            "A": new_row["A"], "B": new_row["B"],
+                            "C": new_row["C"], "D": new_row["D"],
+                        }
+                        st.session_state._race_correct     = new_row["answer"]
+
+                    else:
+                        # Custom mode — clear article and question so user pastes a new one
+                        st.session_state.article  = ""
+                        st.session_state.question = ""
+
+                    # Reset quiz state
+                    st.session_state.quiz_ready     = False
                     st.session_state.answer_checked = False
-                    st.session_state.result = None
+                    st.session_state.result         = None
+                    st.session_state.options        = {}
+                    st.session_state.hints          = []
+                    st.session_state.hints_revealed = 0
+                    st.session_state.screen         = "input"
                     st.rerun()
 
             else:
