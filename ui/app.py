@@ -1069,12 +1069,22 @@ elif st.session_state.screen == "quiz":
                         st.session_state.answer_checked = True
                         st.session_state.result = {"chosen": chosen, "correct": is_correct, "confidence": confidence}
                         st.session_state.session_log.append({
-                            "question":    st.session_state.question[:60],
-                            "chosen":      chosen,
-                            "correct_key": st.session_state.correct_key,
-                            "is_correct":  is_correct,
-                            "confidence":  round(confidence, 3),
-                            "mode":        st.session_state.mode,
+                            "question":      st.session_state.question[:60],
+                            "chosen":        chosen,
+                            "correct_key":   st.session_state.correct_key,
+                            "is_correct":    is_correct,
+                            "confidence":    round(confidence, 3),
+                            "mode":          st.session_state.mode,
+                            # For Model A confusion matrix: encode A/B/C/D as 0/1/2/3
+                            "chosen_idx":    ["A","B","C","D"].index(chosen)
+                                             if chosen in ["A","B","C","D"] else -1,
+                            "correct_idx":   ["A","B","C","D"].index(st.session_state.correct_key)
+                                             if st.session_state.correct_key in ["A","B","C","D"] else -1,
+                            # For Model B: number of non-fallback distractors generated
+                            "n_distractors": sum(
+                                1 for v in st.session_state.options.values()
+                                if not v.startswith("[option") and not v.startswith("[distractor")
+                            ) - 1,  # subtract 1 for the correct answer
                         })
                         st.rerun()
 
@@ -1162,7 +1172,7 @@ elif st.session_state.screen == "analytics":
     accuracy = correct / total if total else 0.0
     avg_lat  = sum(lat) / len(lat) if lat else 0.0
 
-    # ── Metric cards ──────────────────────────────────────────────────────────
+    # ── Top metric cards ──────────────────────────────────────────────────────
     m1, m2, m3, m4 = st.columns(4)
     for col, val, lbl, icon in [
         (m1, str(total),         "Questions",      "📝"),
@@ -1182,6 +1192,179 @@ elif st.session_state.screen == "analytics":
     st.markdown('<div style="height:28px"></div>', unsafe_allow_html=True)
 
     if log:
+        import numpy as np
+
+        # ── Pre-compute all metrics from session log ───────────────────────────
+        y_true = [r["correct_idx"]  for r in log if r.get("correct_idx", -1) >= 0]
+        y_pred = [r["chosen_idx"]   for r in log if r.get("correct_idx", -1) >= 0]
+        confs  = [r["confidence"]   for r in log]
+
+        # Model A metrics (need ≥2 samples)
+        model_a_stats = {}
+        cm_data       = None
+        if len(y_true) >= 2:
+            from sklearn.metrics import (
+                accuracy_score, f1_score, precision_score,
+                recall_score, confusion_matrix,
+            )
+            y_t = np.array(y_true)
+            y_p = np.array(y_pred)
+            model_a_stats = {
+                "accuracy":  accuracy_score(y_t, y_p),
+                "f1":        f1_score(y_t, y_p, average="macro", zero_division=0),
+                "precision": precision_score(y_t, y_p, average="macro", zero_division=0),
+                "recall":    recall_score(y_t, y_p, average="macro", zero_division=0),
+            }
+            cm_data = confusion_matrix(y_t, y_p, labels=[0,1,2,3])
+
+        # Model B proxy metrics
+        dist_logs = [r for r in log if "n_distractors" in r]
+        model_b_stats = {}
+        if dist_logs:
+            good    = sum(1 for r in dist_logs if r["n_distractors"] >= 3)
+            partial = sum(1 for r in dist_logs if 0 < r["n_distractors"] < 3)
+            failed  = sum(1 for r in dist_logs if r["n_distractors"] <= 0)
+            total_b = len(dist_logs)
+            model_b_stats = {
+                "full_coverage":    good / total_b,
+                "partial_coverage": partial / total_b,
+                "failed":           failed / total_b,
+                "avg_distractors":  sum(r["n_distractors"] for r in dist_logs) / total_b,
+                "total":            total_b,
+            }
+
+        # ── MODEL A SECTION ───────────────────────────────────────────────────
+        st.markdown('<div class="section-label">Model A — Answer Verifier Performance</div>',
+                    unsafe_allow_html=True)
+
+        if model_a_stats:
+            sa1, sa2, sa3, sa4 = st.columns(4)
+            for col, val, lbl in [
+                (sa1, f"{model_a_stats['accuracy']:.1%}",  "Accuracy"),
+                (sa2, f"{model_a_stats['f1']:.3f}",        "Macro F1"),
+                (sa3, f"{model_a_stats['precision']:.3f}", "Precision"),
+                (sa4, f"{model_a_stats['recall']:.3f}",    "Recall"),
+            ]:
+                col.markdown(
+                    f'<div style="background:var(--bg-elevated);border:1px solid var(--border);'
+                    f'border-radius:var(--radius-sm);padding:1rem;text-align:center;">'
+                    f'<div style="font-size:1.4rem;font-weight:700;color:var(--accent);'
+                    f'font-family:Space Grotesk,sans-serif;">{val}</div>'
+                    f'<div style="font-size:0.65rem;font-weight:600;letter-spacing:1px;'
+                    f'text-transform:uppercase;color:var(--text-3);margin-top:4px;">{lbl}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
+            col_cm, col_conf = st.columns([1, 1], gap="large")
+
+            with col_cm:
+                st.markdown('<div class="section-label">Confusion Matrix (Last N Inferences)</div>',
+                            unsafe_allow_html=True)
+                th_s = ('font-size:0.65rem;font-weight:700;letter-spacing:1px;'
+                        'text-transform:uppercase;color:var(--text-3);'
+                        'padding:8px 10px;text-align:center;')
+                td_s = 'font-size:0.85rem;font-weight:600;padding:9px 10px;text-align:center;'
+                header_row = ('<tr><td style="' + th_s + '"></td>' +
+                              ''.join(f'<th style="{th_s}">Pred {l}</th>'
+                                      for l in ["A","B","C","D"]) + '</tr>')
+                cm_rows_html = ""
+                for i, true_l in enumerate(["A","B","C","D"]):
+                    cm_rows_html += f'<tr><th style="{th_s}">True {true_l}</th>'
+                    for j in range(4):
+                        val = int(cm_data[i][j]) if cm_data is not None else 0
+                        if i == j:
+                            bg_c, fg_c = "rgba(16,185,129,0.12)", "#10b981"
+                        elif val > 0:
+                            bg_c, fg_c = "rgba(244,63,94,0.07)", "#f43f5e"
+                        else:
+                            bg_c, fg_c = "transparent", "var(--text-3)"
+                        cm_rows_html += (f'<td style="{td_s}background:{bg_c};color:{fg_c};">'
+                                         f'{val}</td>')
+                    cm_rows_html += '</tr>'
+                st.markdown(
+                    f'<div style="background:var(--bg-card);border:1px solid var(--border);'
+                    f'border-radius:var(--radius-sm);overflow:hidden;">'
+                    f'<table style="width:100%;border-collapse:collapse;">'
+                    f'<thead>{header_row}</thead><tbody>{cm_rows_html}</tbody>'
+                    f'</table></div>'
+                    f'<div style="font-size:0.7rem;color:var(--text-3);margin-top:6px;">'
+                    f'Based on {len(y_true)} answered questions this session.</div>',
+                    unsafe_allow_html=True,
+                )
+
+            with col_conf:
+                st.markdown('<div class="section-label">Confidence Distribution</div>',
+                            unsafe_allow_html=True)
+                try:
+                    import plotly.graph_objects as _go
+                    fig_conf = _go.Figure(_go.Histogram(
+                        x=confs, nbinsx=10,
+                        marker_color="#06b6d4", marker_line_width=0, opacity=0.85,
+                    ))
+                    fig_conf.update_layout(
+                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                        font_family="Inter", font_color="#475569",
+                        xaxis_title="Confidence", yaxis_title="Count",
+                        margin=dict(l=0,r=0,t=8,b=0), height=200, bargap=0.05,
+                    )
+                    fig_conf.update_xaxes(showgrid=False, range=[0,1])
+                    fig_conf.update_yaxes(showgrid=True, gridcolor="rgba(148,163,184,0.06)")
+                    st.plotly_chart(fig_conf, use_container_width=True)
+                except Exception:
+                    pass
+        else:
+            st.markdown(
+                '<div style="background:var(--bg-elevated);border:1px dashed var(--border);'
+                'border-radius:var(--radius-sm);padding:1.2rem;color:var(--text-3);'
+                'font-size:0.85rem;text-align:center;">'
+                'Answer at least 2 questions to see Model A metrics.</div>',
+                unsafe_allow_html=True,
+            )
+
+        st.markdown('<div style="height:24px"></div>', unsafe_allow_html=True)
+
+        # ── MODEL B SECTION ───────────────────────────────────────────────────
+        st.markdown('<div class="section-label">Model B — Distractor Generator Performance</div>',
+                    unsafe_allow_html=True)
+
+        if model_b_stats:
+            sb1, sb2, sb3, sb4 = st.columns(4)
+            for col, val, lbl, color in [
+                (sb1, f"{model_b_stats['full_coverage']:.1%}",    "Full Coverage",   "#10b981"),
+                (sb2, f"{model_b_stats['partial_coverage']:.1%}", "Partial Coverage","#f59e0b"),
+                (sb3, f"{model_b_stats['failed']:.1%}",           "Failed",          "#f43f5e"),
+                (sb4, f"{model_b_stats['avg_distractors']:.1f}",  "Avg Distractors", "#06b6d4"),
+            ]:
+                col.markdown(
+                    f'<div style="background:var(--bg-elevated);border:1px solid var(--border);'
+                    f'border-radius:var(--radius-sm);padding:1rem;text-align:center;">'
+                    f'<div style="font-size:1.4rem;font-weight:700;color:{color};'
+                    f'font-family:Space Grotesk,sans-serif;">{val}</div>'
+                    f'<div style="font-size:0.65rem;font-weight:600;letter-spacing:1px;'
+                    f'text-transform:uppercase;color:var(--text-3);margin-top:4px;">{lbl}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            st.markdown(
+                f'<div style="font-size:0.72rem;color:var(--text-3);margin-top:8px;">'
+                f'Full Coverage = all 3 distractor slots filled with real phrases. '
+                f'Based on {model_b_stats["total"]} inferences.</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div style="background:var(--bg-elevated);border:1px dashed var(--border);'
+                'border-radius:var(--radius-sm);padding:1.2rem;color:var(--text-3);'
+                'font-size:0.85rem;text-align:center;">'
+                'Generate at least one quiz to see Model B metrics.</div>',
+                unsafe_allow_html=True,
+            )
+
+        st.markdown('<div style="height:24px"></div>', unsafe_allow_html=True)
+
+        # ── SESSION LOG + CHARTS ──────────────────────────────────────────────
         col_table, col_chart = st.columns([3, 2], gap="large")
 
         with col_table:
