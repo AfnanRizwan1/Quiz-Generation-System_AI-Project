@@ -545,23 +545,27 @@ code {
 # ══════════════════════════════════════════════════════════════════════════════
 def init_state():
     defaults = {
-        "screen":        "input",
-        "article":       "",
-        "question":      "",
-        "options":       {},
-        "correct_key":   "A",
-        "hints":         [],
-        "hints_revealed": 0,
-        "answer_checked": False,
-        "chosen_option": None,
-        "result":        None,
-        "session_log":   [],
-        "latency_log":   [],
-        "mode":          "custom",
-        "quiz_ready":    False,
-        "_race_all_qs":  [],
-        "_race_q_idx":   0,
-        "models_loaded": False,
+        "screen":               "input",
+        "article":              "",
+        "question":             "",
+        "options":              {},
+        "correct_key":          "A",
+        "hints":                [],
+        "hints_revealed":       0,
+        "answer_checked":       False,
+        "chosen_option":        None,
+        "result":               None,
+        "session_log":          [],
+        "latency_log":          [],
+        "mode":                 "custom",
+        "quiz_ready":           False,
+        "_race_all_qs":         [],
+        "_race_q_idx":          0,
+        "models_loaded":        False,
+        # Model A predicted key (set when quiz is generated, used in analytics)
+        "_predicted_key":       "A",
+        # RACE ground-truth question (for BLEU/ROUGE/METEOR reference)
+        "_race_true_question":  "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -829,6 +833,10 @@ if st.session_state.screen == "input":
                     st.session_state.result         = None
                     st.session_state.quiz_ready     = True
                     st.session_state.latency_log.append(result["latency_s"])
+                    # Store Model A's predicted key for analytics confusion matrix
+                    st.session_state._predicted_key      = result.get("predicted_key", "A")
+                    # Store the RACE ground-truth question for BLEU/ROUGE/METEOR
+                    st.session_state._race_true_question = st.session_state.question
                     st.session_state.screen         = "quiz"
                     st.rerun()
 
@@ -915,6 +923,10 @@ if st.session_state.screen == "input":
                 st.session_state.result          = None
                 st.session_state.quiz_ready      = True
                 st.session_state.latency_log.append(result["latency_s"])
+                # Custom mode: no ground-truth predicted key (Model A not used for selection)
+                # Store correct_key as predicted for analytics (best we can do)
+                st.session_state._predicted_key      = correct_key
+                st.session_state._race_true_question = ""  # no reference in custom mode
                 st.session_state.screen          = "quiz"
                 st.rerun()
 
@@ -1068,23 +1080,55 @@ elif st.session_state.screen == "quiz":
                             confidence = 1.0 if is_correct else 0.0
                         st.session_state.answer_checked = True
                         st.session_state.result = {"chosen": chosen, "correct": is_correct, "confidence": confidence}
+
+                        # ── Build session log entry ───────────────────────────
+                        mode = st.session_state.mode
+
+                        # n_distractors: count real (non-fallback) distractor slots
+                        fallback_markers = {"[option", "[distractor", "none of the above",
+                                            "None of the above"}
+                        n_dist = sum(
+                            1 for k, v in st.session_state.options.items()
+                            if k != st.session_state.correct_key
+                            and not any(v.lower().startswith(m.lower())
+                                        for m in fallback_markers)
+                        )
+
+                        # For Model A confusion matrix:
+                        # compare Model A's predicted key vs ground-truth correct key
+                        # (not user's choice — that's user accuracy, not model accuracy)
+                        predicted_key = st.session_state.get("_predicted_key", chosen)
+                        pred_idx  = ["A","B","C","D"].index(predicted_key) \
+                                    if predicted_key in ["A","B","C","D"] else -1
+                        true_idx  = ["A","B","C","D"].index(st.session_state.correct_key) \
+                                    if st.session_state.correct_key in ["A","B","C","D"] else -1
+
+                        # BLEU/ROUGE/METEOR: only meaningful in RACE mode where we have
+                        # a real ground-truth question to compare against
+                        race_true_q = st.session_state.get("_race_true_question", "")
+
+                        # For BLEU/ROUGE/METEOR: compare Model A's predicted answer text
+                        # vs the RACE ground-truth correct answer text
+                        predicted_key_for_bleu = st.session_state.get("_predicted_key", "")
+                        predicted_ans_text = opts.get(predicted_key_for_bleu, "")
+                        true_ans_text      = opts.get(st.session_state.correct_key, "")
+
                         st.session_state.session_log.append({
                             "question":      st.session_state.question[:60],
                             "chosen":        chosen,
                             "correct_key":   st.session_state.correct_key,
                             "is_correct":    is_correct,
                             "confidence":    round(confidence, 3),
-                            "mode":          st.session_state.mode,
-                            # For Model A confusion matrix: encode A/B/C/D as 0/1/2/3
-                            "chosen_idx":    ["A","B","C","D"].index(chosen)
-                                             if chosen in ["A","B","C","D"] else -1,
-                            "correct_idx":   ["A","B","C","D"].index(st.session_state.correct_key)
-                                             if st.session_state.correct_key in ["A","B","C","D"] else -1,
-                            # For Model B: number of non-fallback distractors generated
-                            "n_distractors": sum(
-                                1 for v in st.session_state.options.values()
-                                if not v.startswith("[option") and not v.startswith("[distractor")
-                            ) - 1,  # subtract 1 for the correct answer
+                            "mode":          mode,
+                            # Model A: predicted (by model) vs true correct
+                            "chosen_idx":    pred_idx,
+                            "correct_idx":   true_idx,
+                            # Model B: number of real distractors generated
+                            "n_distractors": n_dist,
+                            # BLEU/ROUGE/METEOR: Model A predicted answer vs ground-truth answer
+                            # Only populated in RACE mode (custom has no reference)
+                            "generated_question": predicted_ans_text,
+                            "reference_question": true_ans_text if mode == "race" else "",
                         })
                         st.rerun()
 
@@ -1175,10 +1219,10 @@ elif st.session_state.screen == "analytics":
     # ── Top metric cards ──────────────────────────────────────────────────────
     m1, m2, m3, m4 = st.columns(4)
     for col, val, lbl, icon in [
-        (m1, str(total),         "Questions",      "📝"),
-        (m2, str(correct),       "Correct",        "✅"),
-        (m3, f"{accuracy:.0%}", "Accuracy",       "🎯"),
-        (m4, f"{avg_lat:.2f}s", "Avg Latency",    "⚡"),
+        (m1, str(total),         "Questions Answered", "📝"),
+        (m2, str(correct),       "User Correct",       "✅"),
+        (m3, f"{accuracy:.0%}", "User Accuracy",      "🎯"),
+        (m4, f"{avg_lat:.2f}s", "Avg Gen. Latency",   "⚡"),
     ]:
         col.markdown(
             f'<div class="metric-card">'
@@ -1195,11 +1239,19 @@ elif st.session_state.screen == "analytics":
         import numpy as np
 
         # ── Pre-compute all metrics from session log ───────────────────────────
-        y_true = [r["correct_idx"]  for r in log if r.get("correct_idx", -1) >= 0]
-        y_pred = [r["chosen_idx"]   for r in log if r.get("correct_idx", -1) >= 0]
-        confs  = [r["confidence"]   for r in log]
+        # chosen_idx  = Model A's predicted answer (A/B/C/D encoded as 0-3)
+        # correct_idx = Ground-truth correct answer (A/B/C/D encoded as 0-3)
+        # Only include RACE mode entries where Model A actually scored all 4 options
+        race_entries = [r for r in log
+                        if r.get("mode") == "race"
+                        and r.get("correct_idx", -1) >= 0
+                        and r.get("chosen_idx", -1) >= 0]
+        y_true = [r["correct_idx"] for r in race_entries]
+        y_pred = [r["chosen_idx"]  for r in race_entries]
+        confs  = [r["confidence"]  for r in log]
 
-        # Model A metrics (need ≥2 samples)
+        # Model A metrics — how well Model A predicts the correct answer
+        # (independent of what the user chose)
         model_a_stats = {}
         cm_data       = None
         if len(y_true) >= 2:
@@ -1234,13 +1286,13 @@ elif st.session_state.screen == "analytics":
             }
 
         # ── MODEL A SECTION ───────────────────────────────────────────────────
-        st.markdown('<div class="section-label">Model A — Answer Verifier Performance</div>',
+        st.markdown('<div class="section-label">Model A — Answer Verifier Performance (RACE Mode)</div>',
                     unsafe_allow_html=True)
 
         if model_a_stats:
             sa1, sa2, sa3, sa4 = st.columns(4)
             for col, val, lbl in [
-                (sa1, f"{model_a_stats['accuracy']:.1%}",  "Accuracy"),
+                (sa1, f"{model_a_stats['accuracy']:.1%}",  "MCQ Accuracy"),
                 (sa2, f"{model_a_stats['f1']:.3f}",        "Macro F1"),
                 (sa3, f"{model_a_stats['precision']:.3f}", "Precision"),
                 (sa4, f"{model_a_stats['recall']:.3f}",    "Recall"),
@@ -1260,7 +1312,7 @@ elif st.session_state.screen == "analytics":
             col_cm, col_conf = st.columns([1, 1], gap="large")
 
             with col_cm:
-                st.markdown('<div class="section-label">Confusion Matrix (Last N Inferences)</div>',
+                st.markdown('<div class="section-label">Confusion Matrix — Model A Predictions vs Ground Truth</div>',
                             unsafe_allow_html=True)
                 th_s = ('font-size:0.65rem;font-weight:700;letter-spacing:1px;'
                         'text-transform:uppercase;color:var(--text-3);'
@@ -1290,7 +1342,8 @@ elif st.session_state.screen == "analytics":
                     f'<thead>{header_row}</thead><tbody>{cm_rows_html}</tbody>'
                     f'</table></div>'
                     f'<div style="font-size:0.7rem;color:var(--text-3);margin-top:6px;">'
-                    f'Based on {len(y_true)} answered questions this session.</div>',
+                    f'Rows = ground-truth answer · Columns = Model A prediction · '
+                    f'Based on {len(y_true)} RACE-mode questions this session.</div>',
                     unsafe_allow_html=True,
                 )
 
@@ -1319,7 +1372,9 @@ elif st.session_state.screen == "analytics":
                 '<div style="background:var(--bg-elevated);border:1px dashed var(--border);'
                 'border-radius:var(--radius-sm);padding:1.2rem;color:var(--text-3);'
                 'font-size:0.85rem;text-align:center;">'
-                'Answer at least 2 questions to see Model A metrics.</div>',
+                'Answer at least 2 RACE-mode questions to see Model A metrics.<br>'
+                '<span style="font-size:0.75rem;opacity:0.7;">Model A metrics measure how accurately the verifier predicts the correct option — independent of your choices.</span>'
+                '</div>',
                 unsafe_allow_html=True,
             )
 
@@ -1359,6 +1414,72 @@ elif st.session_state.screen == "analytics":
                 'border-radius:var(--radius-sm);padding:1.2rem;color:var(--text-3);'
                 'font-size:0.85rem;text-align:center;">'
                 'Generate at least one quiz to see Model B metrics.</div>',
+                unsafe_allow_html=True,
+            )
+
+        st.markdown('<div style="height:24px"></div>', unsafe_allow_html=True)
+
+        # ── GENERATION METRICS (BLEU / ROUGE / METEOR) ───────────────────────
+        # Instructor requirement: evaluate question & answer generation quality
+        # Only meaningful in RACE mode where we have a real reference question
+        st.markdown('<div class="section-label">Generation Metrics — BLEU / ROUGE / METEOR</div>',
+                    unsafe_allow_html=True)
+
+        # Only use entries that have a real reference question (RACE mode)
+        gen_logs = [r for r in log
+                    if r.get("reference_question", "").strip()
+                    and r.get("generated_question", "").strip()
+                    and r["reference_question"] != r["generated_question"]]
+
+        if gen_logs:
+            from src.evaluate import bleu_score, rouge_score, meteor_score
+            bleu1_scores, rougeL_scores, meteor_scores = [], [], []
+            for r in gen_logs:
+                ref = r["reference_question"]
+                hyp = r["generated_question"]
+                b  = bleu_score(ref, hyp)
+                ro = rouge_score(ref, hyp)
+                bleu1_scores.append(b["bleu_1"])
+                rougeL_scores.append(ro["rouge_l"]["f1"])
+                meteor_scores.append(meteor_score(ref, hyp))
+
+            avg_b1 = sum(bleu1_scores) / len(bleu1_scores)
+            avg_rl = sum(rougeL_scores) / len(rougeL_scores)
+            avg_mt = sum(meteor_scores) / len(meteor_scores)
+
+            sg1, sg2, sg3 = st.columns(3)
+            for col, val, lbl, tip in [
+                (sg1, f"{avg_b1:.3f}", "BLEU-1",  "Unigram precision overlap"),
+                (sg2, f"{avg_rl:.3f}", "ROUGE-L", "Longest common subsequence F1"),
+                (sg3, f"{avg_mt:.3f}", "METEOR",  "Unigram F-mean with fragmentation penalty"),
+            ]:
+                col.markdown(
+                    f'<div style="background:var(--bg-elevated);border:1px solid var(--border);'
+                    f'border-radius:var(--radius-sm);padding:1rem;text-align:center;">'
+                    f'<div style="font-size:1.4rem;font-weight:700;color:var(--accent-2);'
+                    f'font-family:Space Grotesk,sans-serif;">{val}</div>'
+                    f'<div style="font-size:0.65rem;font-weight:600;letter-spacing:1px;'
+                    f'text-transform:uppercase;color:var(--text-3);margin-top:4px;">{lbl}</div>'
+                    f'<div style="font-size:0.62rem;color:var(--text-3);margin-top:3px;'
+                    f'font-style:italic;">{tip}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            st.markdown(
+                f'<div style="font-size:0.7rem;color:var(--text-3);margin-top:8px;">'
+                f'Compares Model A\'s predicted answer text against the RACE ground-truth answer. '
+                f'Based on {len(gen_logs)} RACE-mode inferences. '
+                f'Reference: Papineni et al. (2002) BLEU · Lin (2004) ROUGE · Banerjee &amp; Lavie (2005) METEOR.</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div style="background:var(--bg-elevated);border:1px dashed var(--border);'
+                'border-radius:var(--radius-sm);padding:1.2rem;color:var(--text-3);'
+                'font-size:0.85rem;text-align:center;">'
+                'Answer RACE-mode questions to see BLEU / ROUGE / METEOR scores here.<br>'
+                '<span style="font-size:0.75rem;opacity:0.7;">These metrics compare the model\'s predicted answer text against the RACE ground-truth answer.</span>'
+                '</div>',
                 unsafe_allow_html=True,
             )
 

@@ -360,3 +360,168 @@ class TestModelBHintMetrics:
         m = model_b_hint_metrics(y_true, y_pred)
         assert "r2_score" not in m
         assert "rmse"     not in m
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# evaluate — BLEU / ROUGE / METEOR  (instructor-required generation metrics)
+# ══════════════════════════════════════════════════════════════════════════════
+from src.evaluate import bleu_score, rouge_score, meteor_score, generation_metrics
+
+
+class TestBLEU:
+    def test_perfect_match(self):
+        b = bleu_score("the cat sat on the mat", "the cat sat on the mat")
+        assert b["bleu_1"] == 1.0
+        assert b["bleu_avg"] > 0.0
+
+    def test_no_overlap(self):
+        b = bleu_score("the cat sat on the mat", "dogs run fast in parks")
+        assert b["bleu_1"] == 0.0
+        assert b["bleu_avg"] == 0.0
+
+    def test_partial_overlap(self):
+        b = bleu_score("the cat sat on the mat", "the cat ran away quickly")
+        assert 0.0 < b["bleu_1"] < 1.0
+
+    def test_empty_hypothesis(self):
+        b = bleu_score("the cat sat on the mat", "")
+        assert b["bleu_avg"] == 0.0
+
+    def test_returns_all_keys(self):
+        b = bleu_score("hello world", "hello world")
+        for key in ["bleu_1", "bleu_2", "bleu_3", "bleu_4", "bleu_avg"]:
+            assert key in b
+
+    def test_brevity_penalty_short_hypothesis(self):
+        # Short hypothesis should be penalised
+        b = bleu_score("the quick brown fox jumps over the lazy dog", "the fox")
+        assert b["brevity_penalty"] < 1.0
+
+
+class TestROUGE:
+    def test_perfect_match(self):
+        r = rouge_score("the cat sat on the mat", "the cat sat on the mat")
+        assert r["rouge_1"]["f1"] == 1.0
+        assert r["rouge_l"]["f1"] == 1.0
+
+    def test_no_overlap(self):
+        r = rouge_score("the cat sat on the mat", "dogs run fast in parks")
+        assert r["rouge_1"]["f1"] == 0.0
+
+    def test_partial_overlap(self):
+        r = rouge_score("the cat sat on the mat", "the cat ran away")
+        assert 0.0 < r["rouge_1"]["f1"] < 1.0
+
+    def test_rouge_2_lower_than_rouge_1(self):
+        # ROUGE-2 is always <= ROUGE-1 for partial matches
+        r = rouge_score("the quick brown fox jumps", "the quick fox runs fast")
+        assert r["rouge_2"]["f1"] <= r["rouge_1"]["f1"]
+
+    def test_returns_all_keys(self):
+        r = rouge_score("hello world", "hello world")
+        for key in ["rouge_1", "rouge_2", "rouge_l"]:
+            assert key in r
+            for sub in ["precision", "recall", "f1"]:
+                assert sub in r[key]
+
+
+class TestMETEOR:
+    def test_perfect_match(self):
+        score = meteor_score("the cat sat on the mat", "the cat sat on the mat")
+        assert score > 0.8
+
+    def test_no_overlap(self):
+        score = meteor_score("the cat sat on the mat", "dogs run fast in parks")
+        assert score == 0.0
+
+    def test_range(self):
+        score = meteor_score("the quick brown fox", "the quick fox runs")
+        assert 0.0 <= score <= 1.0
+
+    def test_empty_inputs(self):
+        assert meteor_score("", "hello") == 0.0
+        assert meteor_score("hello", "") == 0.0
+
+
+class TestGenerationMetrics:
+    def test_corpus_level(self):
+        refs = ["the cat sat on the mat", "dogs are friendly animals"]
+        hyps = ["the cat sat on the mat", "dogs are nice creatures"]
+        m = generation_metrics(refs, hyps)
+        for key in ["bleu_1", "bleu_avg", "rouge_1_f1", "rouge_l_f1", "meteor"]:
+            assert key in m
+        assert m["n_samples"] == 2
+
+    def test_all_perfect(self):
+        refs = ["hello world", "foo bar baz"]
+        hyps = ["hello world", "foo bar baz"]
+        m = generation_metrics(refs, hyps)
+        assert m["bleu_1"] == 1.0
+        assert m["rouge_1_f1"] == 1.0
+
+    def test_mismatched_lengths_raises(self):
+        with pytest.raises(AssertionError):
+            generation_metrics(["a", "b"], ["a"])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# inference — custom-mode helpers
+# ══════════════════════════════════════════════════════════════════════════════
+from src.inference import _split_sentences_original, _extract_qa_from_article, _clean_answer
+
+
+class TestSplitSentencesOriginal:
+    def test_splits_on_punctuation(self):
+        text = "Prana was a dog. He loved apples. The garden was full of birds."
+        result = _split_sentences_original(text)
+        assert len(result) >= 3
+
+    def test_min_length_filter(self):
+        text = "Hi. This is a longer sentence that should survive. Short."
+        result = _split_sentences_original(text)
+        for s in result:
+            assert len(s) >= 15
+
+    def test_fallback_to_chunks(self):
+        text = " ".join(["word"] * 60)
+        result = _split_sentences_original(text)
+        assert len(result) >= 2
+
+
+class TestGenerateQuestionNatural:
+    def test_born_in_pattern(self):
+        # "X was born in Y" -> "Where was X born?"
+        result = _extract_qa_from_article(
+            "Marie Curie was born in Warsaw, Poland. She studied physics.")
+        assert result is not None
+        q, a, t, _ = result
+        assert "born" in q.lower() or "where" in q.lower()
+        assert "Warsaw" in a or "Poland" in a
+
+    def test_invented_pattern(self):
+        result = _extract_qa_from_article(
+            "Thomas Edison invented the phonograph in his laboratory.")
+        assert result is not None
+        q, a, t, _ = result
+        assert "invent" in q.lower() or "Edison" in q
+        assert len(a) > 2
+
+    def test_won_pattern(self):
+        result = _extract_qa_from_article(
+            "Malala Yousafzai won the Nobel Peace Prize in 2014.")
+        assert result is not None
+        q, a, t, _ = result
+        assert "win" in q.lower() or "won" in q.lower()
+        assert "Nobel" in a or "Prize" in a
+
+    def test_fallback_no_proper_noun(self):
+        # Should return None or a fallback, not crash
+        result = _extract_qa_from_article(
+            "although he went outside quickly and ran away fast")
+        # Either None or a valid tuple
+        assert result is None or (isinstance(result, tuple) and len(result) == 4)
+
+    def test_clean_answer_strips_trailing(self):
+        assert _clean_answer("Warsaw, Poland,") == "Warsaw, Poland"
+        assert _clean_answer("the phonograph in") == "The Phonograph"
+        assert _clean_answer("Nobel Peace Prize.") == "Nobel Peace Prize"

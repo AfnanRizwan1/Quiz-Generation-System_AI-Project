@@ -150,9 +150,11 @@ def extract_candidate_phrases(article: str, top_n: int = 40) -> list:
                    for i in range(len(clean) - 2))
 
     freq = Counter(phrases)
-    # Remove single-occurrence noise for multi-word phrases
+    # Include all multi-word phrases (even single-occurrence ones) since
+    # short articles may not have repeated bigrams. Single-word candidates
+    # still require frequency ≥ 1 (always true). Rank by frequency descending.
     candidates = [p for p, c in freq.most_common(top_n * 3)
-                  if len(p.split()) == 1 or c > 1]
+                  if len(p.split()) >= 1]   # include all, ranked by freq
 
     # Deduplicate preserving order
     seen, unique = set(), []
@@ -213,7 +215,7 @@ def distractor_features(candidate: str, correct_answer: str,
                         cand_word_set: set = None,
                         ) -> np.ndarray:
     """
-    Feature vector per candidate (8 features + 2 optional SBERT).
+    Feature vector per candidate (9 features + 2 optional SBERT).
     All TF-IDF vectors and word sets can be passed precomputed to avoid
     redundant .transform() and .split() calls inside tight loops.
 
@@ -224,9 +226,10 @@ def distractor_features(candidate: str, correct_answer: str,
       [4]  Candidate length (word count, normalised)
       [5]  Word overlap: candidate tokens in article
       [6]  Word overlap: candidate tokens in question
-      [7]  Is multi-word phrase (0/1)
-      [8]* SBERT cosine sim: candidate <-> correct answer  (if available)
-      [9]* SBERT cosine sim: candidate <-> question        (if available)
+      [7]  Is multi-word phrase (graduated: 0/0.5/1.0)
+      [8]  Character-level bigram Jaccard similarity: candidate <-> answer
+      [9]* SBERT cosine sim: candidate <-> correct answer  (if available)
+      [10]* SBERT cosine sim: candidate <-> question       (if available)
     """
     # ── Compute only what wasn't passed in ────────────────────────────────────
     if cand_vec_n is None:
@@ -258,10 +261,28 @@ def distractor_features(candidate: str, correct_answer: str,
     length_norm = len(cand_words) / 5.0
     overlap_art = len(cand_word_set & art_word_set) / (len(cand_word_set) + 1e-9)
     overlap_q   = len(cand_word_set & q_word_set)   / (len(cand_word_set) + 1e-9)
-    is_phrase   = float(len(cand_words) > 1)
+    # is_phrase: 0 for single word, 0.5 for bigram, 1.0 for trigram+
+    n_words   = len(cand_words)
+    is_phrase = min((n_words - 1) / 2.0, 1.0)  # 0→0, 2→0.5, 3+→1.0
+
+    # ── Character-level match score (rubric requirement) ──────────────────────
+    # Measures character-level overlap between candidate and correct answer.
+    # Uses character bigram Jaccard similarity — captures partial string matches
+    # (e.g. "phonograph" vs "photograph" share many character bigrams).
+    def _char_bigrams(s: str) -> set:
+        s = s.lower().replace(" ", "")
+        return {s[i:i+2] for i in range(len(s) - 1)} if len(s) >= 2 else set()
+
+    cand_cbg = _char_bigrams(candidate)
+    ans_cbg  = _char_bigrams(correct_answer)
+    if cand_cbg | ans_cbg:
+        char_match = len(cand_cbg & ans_cbg) / (len(cand_cbg | ans_cbg) + 1e-9)
+    else:
+        char_match = 0.0
 
     feats = [sim_cand_ans, sim_cand_q, sim_cand_art,
-             freq, length_norm, overlap_art, overlap_q, is_phrase]
+             freq, length_norm, overlap_art, overlap_q, is_phrase,
+             char_match]
 
     if HAS_SBERT and cand_sbert is not None:
         feats.extend([float(np.dot(cand_sbert, ans_sbert)),
@@ -430,14 +451,15 @@ def generate_distractors(article: str, question: str, correct_answer: str,
                          use_sbert: bool = False) -> list:
     """
     Full distractor generation pipeline — optimized:
-      1. Extract phrase candidates
+      1. Extract phrase candidates (prefer multi-word phrases)
       2. Batch-filter candidates too close to the answer (one matrix op)
       3. Compute all features in batch (precomputed row vectors)
       4. Score with ranker (single predict_proba call on full matrix)
       5. Diversity filter with cosine similarity
-      6. Quality control + fallback
+      6. Quality control: prefer multi-word distractors over single words
+      7. Fallback to single words only if multi-word pool is exhausted
     """
-    candidates = extract_candidate_phrases(article, top_n=60)
+    candidates = extract_candidate_phrases(article, top_n=80)
     if not candidates:
         return [f"[distractor {i+1}]" for i in range(top_k)]
 
@@ -498,12 +520,17 @@ def generate_distractors(article: str, question: str, correct_answer: str,
     probs = ranker_model.predict_proba(feat_matrix)[:, 1]
     order = np.argsort(probs)[::-1]
 
-    # ── Diversity filtering ───────────────────────────────────────────────────
+    # ── Diversity filtering with multi-word preference ────────────────────────
+    # Two-pass selection:
+    #   Pass 1: prefer multi-word candidates (2+ words) — better MCQ options
+    #   Pass 2: fill remaining slots with single-word candidates if needed
     selected      = []
     selected_vecs = []
-    for idx in order:
+
+    def _try_add(idx):
+        """Try to add candidate at idx. Returns True if added."""
         if len(selected) >= top_k:
-            break
+            return False
         cand_vec = filt_vecs_n[idx]
         too_similar = any(
             float((cand_vec * sv.T).toarray()[0, 0]) >= diversity_threshold
@@ -512,6 +539,23 @@ def generate_distractors(article: str, question: str, correct_answer: str,
         if not too_similar:
             selected.append(filtered[idx])
             selected_vecs.append(cand_vec)
+            return True
+        return False
+
+    # Pass 1: multi-word candidates only
+    for idx in order:
+        if len(selected) >= top_k:
+            break
+        if len(filtered[idx].split()) >= 2:
+            _try_add(idx)
+
+    # Pass 2: single-word candidates to fill remaining slots
+    if len(selected) < top_k:
+        for idx in order:
+            if len(selected) >= top_k:
+                break
+            if len(filtered[idx].split()) == 1:
+                _try_add(idx)
 
     while len(selected) < top_k:
         selected.append(f"[option {len(selected)+1}]")
@@ -807,7 +851,10 @@ def evaluate_hint_scorer(model, X_val, y_val, X_test, y_test):
 # ══════════════════════════════════════════════════════════════════════════════
 def inspect_samples(df, tfidf_vec, dist_ranker, hint_scorer,
                     n_samples: int = 3, use_sbert: bool = False):
-    """Print generated distractors and hints for manual quality assessment."""
+    """
+    Print generated distractors and hints for manual quality assessment.
+    Shows the full pipeline output including distractor quality indicators.
+    """
     print("\n--- Qualitative Sample Inspection ---")
     for i, row in enumerate(df.head(n_samples).itertuples(index=False)):
         correct = getattr(row, row.answer)
@@ -816,20 +863,24 @@ def inspect_samples(df, tfidf_vec, dist_ranker, hint_scorer,
         print(f"  Question        : {row.question}")
         print(f"  Correct answer  : {correct}")
 
+        # Show all 4 real options for reference
+        opt_keys = ["A", "B", "C", "D"]
+        real_opts = [getattr(row, k) for k in opt_keys]
+        print(f"  Real options    : {' | '.join(f'{k}={getattr(row,k)[:25]}' for k in opt_keys)}")
+
         distractors = generate_distractors(
             row.article, row.question, correct,
             tfidf_vec, dist_ranker, top_k=3, use_sbert=use_sbert)
         print("  Generated distractors:")
         for j, d in enumerate(distractors, 1):
-            print(f"    {j}. {d}")
+            # Flag single-word distractors as low quality
+            quality = "⚠ single word" if len(d.split()) == 1 else "✓"
+            print(f"    {j}. {d!r:<30} {quality}")
 
         hints = generate_hints(
             row.article, row.question, correct,
             tfidf_vec, hint_scorer, n_hints=3, use_sbert=use_sbert)
         print("  Generated hints:")
-        for j, h in enumerate(hints, 1):
-            print(f"    Hint {j}: {h[:100]}")
-        print(f"  Generated hints:")
         for j, h in enumerate(hints, 1):
             print(f"    Hint {j}: {h[:100]}")
 

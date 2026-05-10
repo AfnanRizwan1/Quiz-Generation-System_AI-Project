@@ -8,13 +8,280 @@ Model A: MCQ accuracy, Macro-F1, Exact Match, Precision, Recall,
 Model B: Binary classification metrics (distractor ranker),
          Binary classification metrics (hint scorer),
          NDCG@K for ranking quality
+
+Generation metrics (instructor requirement):
+  BLEU, ROUGE-1/2/L, METEOR — for generated questions and answers
 """
 
+import re
 import numpy as np
 from sklearn.metrics import (
     accuracy_score, f1_score, precision_score, recall_score,
     confusion_matrix, classification_report, ndcg_score,
 )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NLP Generation Metrics  (BLEU / ROUGE / METEOR)
+# Required by instructor update — evaluate generated questions & answers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _tokenize(text: str) -> list:
+    """Simple whitespace + punctuation tokenizer (no external NLP tools needed)."""
+    return re.findall(r'\b[a-z0-9]+\b', text.lower())
+
+
+def _ngrams(tokens: list, n: int) -> list:
+    return [tuple(tokens[i:i+n]) for i in range(len(tokens) - n + 1)]
+
+
+def bleu_score(reference: str, hypothesis: str, max_n: int = 4) -> dict:
+    """
+    Compute sentence-level BLEU score (BLEU-1 through BLEU-4).
+
+    Uses modified n-gram precision with brevity penalty.
+    Reference: Papineni et al. (2002). BLEU: a Method for Automatic
+    Evaluation of Machine Translation. ACL 2002.
+
+    Args:
+        reference  : ground-truth string
+        hypothesis : generated string
+    Returns:
+        dict with bleu_1, bleu_2, bleu_3, bleu_4, bleu_avg
+    """
+    import math
+    ref_tokens  = _tokenize(reference)
+    hyp_tokens  = _tokenize(hypothesis)
+
+    if not hyp_tokens:
+        return {f"bleu_{n}": 0.0 for n in range(1, max_n + 1)} | {"bleu_avg": 0.0}
+
+    scores = {}
+    log_avg = 0.0
+    valid_n = 0
+
+    for n in range(1, max_n + 1):
+        ref_ngrams = _ngrams(ref_tokens, n)
+        hyp_ngrams = _ngrams(hyp_tokens, n)
+
+        if not hyp_ngrams:
+            scores[f"bleu_{n}"] = 0.0
+            continue
+
+        # Clipped count
+        from collections import Counter
+        ref_counts = Counter(ref_ngrams)
+        hyp_counts = Counter(hyp_ngrams)
+        clipped    = sum(min(c, ref_counts[ng]) for ng, c in hyp_counts.items())
+        precision  = clipped / len(hyp_ngrams)
+        scores[f"bleu_{n}"] = round(precision, 4)
+
+        if precision > 0:
+            log_avg += math.log(precision)
+            valid_n += 1
+
+    # Brevity penalty
+    bp = 1.0 if len(hyp_tokens) >= len(ref_tokens) else \
+         math.exp(1 - len(ref_tokens) / len(hyp_tokens))
+
+    if valid_n > 0:
+        bleu_avg = round(bp * math.exp(log_avg / valid_n), 4)
+    else:
+        bleu_avg = 0.0
+
+    scores["bleu_avg"] = bleu_avg
+    scores["brevity_penalty"] = round(bp, 4)
+    return scores
+
+
+def rouge_score(reference: str, hypothesis: str) -> dict:
+    """
+    Compute ROUGE-1, ROUGE-2, and ROUGE-L scores.
+
+    Reference: Lin (2004). ROUGE: A Package for Automatic Evaluation
+    of Summaries. ACL Workshop 2004.
+
+    Args:
+        reference  : ground-truth string
+        hypothesis : generated string
+    Returns:
+        dict with rouge_1, rouge_2, rouge_l (each has precision, recall, f1)
+    """
+    ref_tokens = _tokenize(reference)
+    hyp_tokens = _tokenize(hypothesis)
+
+    def _rouge_n(ref, hyp, n):
+        from collections import Counter
+        ref_ng = Counter(_ngrams(ref, n))
+        hyp_ng = Counter(_ngrams(hyp, n))
+        if not ref_ng or not hyp_ng:
+            return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+        overlap  = sum(min(c, ref_ng[ng]) for ng, c in hyp_ng.items())
+        prec     = overlap / sum(hyp_ng.values())
+        rec      = overlap / sum(ref_ng.values())
+        f1       = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+        return {"precision": round(prec, 4), "recall": round(rec, 4), "f1": round(f1, 4)}
+
+    def _lcs_length(a, b):
+        """Dynamic programming LCS length."""
+        m, n = len(a), len(b)
+        if m == 0 or n == 0:
+            return 0
+        # Space-optimised DP
+        prev = [0] * (n + 1)
+        for i in range(1, m + 1):
+            curr = [0] * (n + 1)
+            for j in range(1, n + 1):
+                if a[i-1] == b[j-1]:
+                    curr[j] = prev[j-1] + 1
+                else:
+                    curr[j] = max(prev[j], curr[j-1])
+            prev = curr
+        return prev[n]
+
+    def _rouge_l(ref, hyp):
+        lcs = _lcs_length(ref, hyp)
+        if not ref or not hyp:
+            return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+        prec = lcs / len(hyp)
+        rec  = lcs / len(ref)
+        f1   = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+        return {"precision": round(prec, 4), "recall": round(rec, 4), "f1": round(f1, 4)}
+
+    return {
+        "rouge_1": _rouge_n(ref_tokens, hyp_tokens, 1),
+        "rouge_2": _rouge_n(ref_tokens, hyp_tokens, 2),
+        "rouge_l": _rouge_l(ref_tokens, hyp_tokens),
+    }
+
+
+def meteor_score(reference: str, hypothesis: str) -> float:
+    """
+    Compute METEOR score (simplified — unigram F-mean with harmonic mean,
+    no stemming or synonym matching, which requires external resources).
+
+    Reference: Banerjee & Lavie (2005). METEOR: An Automatic Metric for
+    MT Evaluation with Improved Correlation with Human Judgments. ACL 2005.
+
+    Args:
+        reference  : ground-truth string
+        hypothesis : generated string
+    Returns:
+        float METEOR score in [0, 1]
+    """
+    from collections import Counter
+    ref_tokens = _tokenize(reference)
+    hyp_tokens = _tokenize(hypothesis)
+
+    if not ref_tokens or not hyp_tokens:
+        return 0.0
+
+    ref_counts = Counter(ref_tokens)
+    hyp_counts = Counter(hyp_tokens)
+
+    # Unigram matches (clipped)
+    matches = sum(min(c, ref_counts[w]) for w, c in hyp_counts.items())
+
+    if matches == 0:
+        return 0.0
+
+    precision = matches / len(hyp_tokens)
+    recall    = matches / len(ref_tokens)
+
+    # Harmonic mean with recall weighted 9x (standard METEOR α=0.9)
+    alpha = 0.9
+    f_mean = precision * recall / (alpha * precision + (1 - alpha) * recall)
+
+    # Fragmentation penalty (simplified: penalise if hypothesis is much shorter)
+    # Full METEOR uses chunk counting; we approximate with length ratio
+    frag_penalty = 0.5 * (1 - min(len(hyp_tokens) / len(ref_tokens), 1.0)) ** 3
+
+    meteor = f_mean * (1 - frag_penalty)
+    return round(float(meteor), 4)
+
+
+def generation_metrics(references: list, hypotheses: list) -> dict:
+    """
+    Compute corpus-level BLEU, ROUGE, and METEOR scores for a list of
+    (reference, hypothesis) pairs.
+
+    This is the primary evaluation function for the generation task
+    (question generation and answer generation in custom mode).
+
+    Args:
+        references  : list of ground-truth strings
+        hypotheses  : list of generated strings
+    Returns:
+        dict with averaged BLEU-1/2/3/4/avg, ROUGE-1/2/L F1, METEOR
+    """
+    assert len(references) == len(hypotheses), \
+        "references and hypotheses must have the same length"
+
+    bleu_1_scores, bleu_2_scores, bleu_3_scores, bleu_4_scores, bleu_avg_scores = [], [], [], [], []
+    rouge_1_scores, rouge_2_scores, rouge_l_scores = [], [], []
+    meteor_scores = []
+
+    for ref, hyp in zip(references, hypotheses):
+        b = bleu_score(ref, hyp)
+        bleu_1_scores.append(b["bleu_1"])
+        bleu_2_scores.append(b["bleu_2"])
+        bleu_3_scores.append(b["bleu_3"])
+        bleu_4_scores.append(b["bleu_4"])
+        bleu_avg_scores.append(b["bleu_avg"])
+
+        r = rouge_score(ref, hyp)
+        rouge_1_scores.append(r["rouge_1"]["f1"])
+        rouge_2_scores.append(r["rouge_2"]["f1"])
+        rouge_l_scores.append(r["rouge_l"]["f1"])
+
+        meteor_scores.append(meteor_score(ref, hyp))
+
+    def avg(lst): return round(float(np.mean(lst)), 4)
+
+    return {
+        "bleu_1":   avg(bleu_1_scores),
+        "bleu_2":   avg(bleu_2_scores),
+        "bleu_3":   avg(bleu_3_scores),
+        "bleu_4":   avg(bleu_4_scores),
+        "bleu_avg": avg(bleu_avg_scores),
+        "rouge_1_f1": avg(rouge_1_scores),
+        "rouge_2_f1": avg(rouge_2_scores),
+        "rouge_l_f1": avg(rouge_l_scores),
+        "meteor":   avg(meteor_scores),
+        "n_samples": len(references),
+    }
+
+
+def evaluate_question_generation(val_df, generated_questions: list) -> dict:
+    """
+    Evaluate generated questions against RACE ground-truth questions.
+
+    Args:
+        val_df             : DataFrame with 'question' column (ground truth)
+        generated_questions: list of generated question strings (same length)
+    Returns:
+        generation_metrics dict
+    """
+    references  = val_df["question"].tolist()[:len(generated_questions)]
+    hypotheses  = generated_questions
+    return generation_metrics(references, hypotheses)
+
+
+def evaluate_answer_generation(val_df, generated_answers: list) -> dict:
+    """
+    Evaluate generated answers against RACE ground-truth correct answers.
+
+    Args:
+        val_df           : DataFrame with 'answer' column (A/B/C/D) and A/B/C/D columns
+        generated_answers: list of generated answer strings (same length)
+    Returns:
+        generation_metrics dict
+    """
+    references = []
+    for _, row in val_df.iterrows():
+        references.append(str(row[row["answer"]]))  # correct option text
+    references = references[:len(generated_answers)]
+    return generation_metrics(references, generated_answers)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -450,9 +717,9 @@ def generate_pdf_report(data: dict, out_dir: str = "report") -> str:
     # ── Unsupervised / Semi-supervised ────────────────────────────────────────
     story.append(Paragraph("Model A — Unsupervised & Semi-Supervised", S_H1))
     story.append(Paragraph(
-        "Evaluated on OHE features (5000-dim binary bag-of-words). "
-        "K-Means groups question-answer pairs into 4 clusters. "
-        "Label Spreading uses 15% labeled samples to propagate labels.",
+        "K-Means groups question-answer pairs into 4 clusters using OHE features (5000-dim). "
+        "Silhouette computed on SVD-reduced (50-dim) stratified subsample. "
+        "Label Spreading uses 30% labeled samples with RBF kernel on SVD-reduced (100-dim) features.",
         S_BODY))
 
     km = data.get("km_metrics", {})
@@ -528,6 +795,45 @@ def generate_pdf_report(data: dict, out_dir: str = "report") -> str:
         t = Table(hs_rows, colWidths=[2.5*cm, 3*cm, 3*cm, 3*cm, 3*cm, 3.5*cm])
         t.setStyle(base_table_style())
         story.append(t)
+
+    story.append(PageBreak())
+
+    # ── Generation Metrics (BLEU / ROUGE / METEOR) ────────────────────────────
+    story.append(Paragraph("Generation Metrics — BLEU / ROUGE / METEOR", S_H1))
+    story.append(Paragraph(
+        "Evaluation of the question generation and answer generation sub-tasks "
+        "using standard NLP generation metrics. "
+        "Reference: Papineni et al. (2002) BLEU; Lin (2004) ROUGE; Banerjee & Lavie (2005) METEOR.",
+        S_BODY))
+
+    gq = data.get("gen_q_metrics", {})
+    ga = data.get("gen_a_metrics", {})
+
+    if gq or ga:
+        gen_rows = [["Task", "BLEU-1", "BLEU-2", "BLEU-4", "ROUGE-1", "ROUGE-L", "METEOR"]]
+        if gq:
+            gen_rows.append([
+                "Question Generation",
+                f4(gq.get("bleu_1", 0)),   f4(gq.get("bleu_2", 0)),
+                f4(gq.get("bleu_4", 0)),   f4(gq.get("rouge_1_f1", 0)),
+                f4(gq.get("rouge_l_f1", 0)), f4(gq.get("meteor", 0)),
+            ])
+        if ga:
+            gen_rows.append([
+                "Answer Generation",
+                f4(ga.get("bleu_1", 0)),   f4(ga.get("bleu_2", 0)),
+                f4(ga.get("bleu_4", 0)),   f4(ga.get("rouge_1_f1", 0)),
+                f4(ga.get("rouge_l_f1", 0)), f4(ga.get("meteor", 0)),
+            ])
+        col_w = [4.5*cm, 2.2*cm, 2.2*cm, 2.2*cm, 2.5*cm, 2.5*cm, 2.5*cm]
+        t = Table(gen_rows, colWidths=col_w)
+        t.setStyle(base_table_style())
+        story.append(t)
+        story.append(Paragraph(
+            "Note: BLEU measures n-gram precision overlap; ROUGE measures recall-oriented overlap; "
+            "METEOR uses unigram F-mean with fragmentation penalty. "
+            "Higher scores indicate generated text is closer to the reference.",
+            S_SMALL))
 
     story.append(PageBreak())
 
@@ -695,11 +1001,36 @@ if __name__ == "__main__":
         km = joblib.load(km_path)
         cluster_labels = km.predict(X_ohe_va)
         purity = clustering_purity(y4_va, cluster_labels)
-        sil    = silhouette(X_ohe_va, cluster_labels, sample_size=3000)
+
+        # Silhouette: use SVD-reduced dense features (same as training fix)
+        # Raw 5000-dim sparse gives nan/0 — must reduce first
+        sil = float("nan")
+        try:
+            from sklearn.decomposition import TruncatedSVD
+            from sklearn.metrics import silhouette_score as _sil_score
+            rng_km = np.random.default_rng(42)
+            # Stratified subsample: 250 per cluster → 1000 total
+            sub_idx = []
+            for c in range(4):
+                c_idx = np.where(cluster_labels == c)[0]
+                chosen = rng_km.choice(c_idx, size=min(250, len(c_idx)), replace=False)
+                sub_idx.extend(chosen.tolist())
+            sub_idx = np.array(sub_idx)
+            X_sub   = X_ohe_va[sub_idx]
+            lab_sub = cluster_labels[sub_idx]
+            n_comp  = min(50, X_sub.shape[1] - 1, X_sub.shape[0] - 1)
+            svd_km  = TruncatedSVD(n_components=n_comp, random_state=42)
+            X_dense_km = svd_km.fit_transform(X_sub)
+            if len(np.unique(lab_sub)) >= 2:
+                sil = float(_sil_score(X_dense_km, lab_sub, random_state=42))
+        except Exception as e:
+            print(f"  [WARN] Silhouette computation failed: {e}")
+
         km_metrics = {"purity": purity, "silhouette": sil}
+        sil_str = f"{sil:.4f}" if not np.isnan(sil) else "nan"
         print(f"\n  K-Means (MiniBatch, k=4)")
         print(f"     Cluster-label purity  = {purity:.4f}")
-        print(f"     Silhouette score      = {sil:.4f}")
+        print(f"     Silhouette score      = {sil_str}  (SVD-reduced subsample)")
     else:
         print("  [SKIP] K-Means — model not found")
 
@@ -709,15 +1040,36 @@ if __name__ == "__main__":
         ls = joblib.load(ls_path)
         rng = np.random.default_rng(42)
         n_va = X_ohe_va.shape[0]
-        idx  = rng.choice(n_va, size=min(2000, n_va), replace=False)
+        idx  = rng.choice(n_va, size=min(3000, n_va), replace=False)
         from scipy.sparse import issparse
-        X_dense = X_ohe_va[idx].toarray() if issparse(X_ohe_va) else X_ohe_va[idx]
-        ls_preds = ls.predict(X_dense)
+
+        # LabelSpreading was trained on SVD-reduced (100-dim) features.
+        # Must apply the same SVD transform before predicting.
+        # The SVD is stored as ls._svd_transform if available,
+        # otherwise we refit a fresh SVD on the same subsample size.
+        X_sub_ls = X_ohe_va[idx]
+        if hasattr(ls, "_svd_transform"):
+            svd_ls = ls._svd_transform
+            X_dense_ls = svd_ls.transform(X_sub_ls)
+        else:
+            # Fallback: refit SVD with same n_components the model expects
+            n_feats_expected = ls.n_features_in_
+            from sklearn.decomposition import TruncatedSVD
+            svd_ls = TruncatedSVD(n_components=n_feats_expected, random_state=42)
+            # Fit on training OHE to get a consistent transform
+            X_tr_sub = X_ohe_tr[rng.choice(X_ohe_tr.shape[0],
+                                            size=min(4000, X_ohe_tr.shape[0]),
+                                            replace=False)]
+            svd_ls.fit(X_tr_sub)
+            X_dense_ls = svd_ls.transform(X_sub_ls)
+
+        ls_preds = ls.predict(X_dense_ls)
         ls_m = model_a_metrics(y4_va[idx], ls_preds)
         ls_metrics = {"acc": ls_m["accuracy"], "f1": ls_m["macro_f1"], "n_samples": len(idx)}
-        print(f"\n  Label Spreading (semi-supervised, 15% labeled)")
+        print(f"\n  Label Spreading (semi-supervised, 30% labeled, RBF kernel)")
         print(f"     Val Acc={ls_m['accuracy']:.4f}  Macro-F1={ls_m['macro_f1']:.4f}")
         print(f"     (evaluated on {len(idx)} val samples)")
+        print(f"     Random baseline = 0.2500  |  Improvement = +{ls_m['accuracy']-0.25:.4f}")
     else:
         print("  [SKIP] Label Spreading — model not found")
 
@@ -778,11 +1130,67 @@ if __name__ == "__main__":
     else:
         print("  [SKIP] Hint Scorer — model not found or empty dataset")
 
+    # ── Generate PDF report ───────────────────────────────────────────────────
+    # ── Generation metrics (BLEU / ROUGE / METEOR) ───────────────────────────
+    print("\n" + "="*60)
+    print("  GENERATION METRICS  (BLEU / ROUGE / METEOR)")
+    print("  Instructor requirement: evaluate question & answer generation")
+    print("="*60)
+
+    gen_q_metrics  = {}
+    gen_a_metrics  = {}
+
+    try:
+        from src.model_a_train import generate_questions
+        from src.inference import get_ohe_vec
+
+        ohe_vec_gen = get_ohe_vec()
+        sample_df   = val_df2.head(200).copy()
+
+        print("\n  Generating questions for 200 val samples …")
+        gen_questions = []
+        for _, row in sample_df.iterrows():
+            qs = generate_questions(row["article"], row["answer"], ohe_vec_gen, top_k=1)
+            gen_questions.append(qs[0] if qs else "What is the main idea?")
+
+        gen_q_metrics = evaluate_question_generation(sample_df, gen_questions)
+        print(f"  Question Generation:")
+        print(f"     BLEU-1={gen_q_metrics['bleu_1']:.4f}  BLEU-2={gen_q_metrics['bleu_2']:.4f}"
+              f"  BLEU-4={gen_q_metrics['bleu_4']:.4f}  BLEU-avg={gen_q_metrics['bleu_avg']:.4f}")
+        print(f"     ROUGE-1={gen_q_metrics['rouge_1_f1']:.4f}  ROUGE-2={gen_q_metrics['rouge_2_f1']:.4f}"
+              f"  ROUGE-L={gen_q_metrics['rouge_l_f1']:.4f}")
+        print(f"     METEOR={gen_q_metrics['meteor']:.4f}")
+
+        # Answer generation: use the model's top-scored option as generated answer
+        print("\n  Evaluating answer generation for 200 val samples …")
+        from src.inference import get_tfidf_vec, get_dense_scaler, get_verifier, score_options
+        tfidf_inf = get_tfidf_vec()
+        scaler_inf = get_dense_scaler()
+        verifier_inf, _ = get_verifier()
+
+        gen_answers = []
+        for _, row in sample_df.iterrows():
+            opts = {"A": row["A"], "B": row["B"], "C": row["C"], "D": row["D"]}
+            scores_inf = score_options(row["article"], row["question"], opts,
+                                       verifier_inf, tfidf_inf, scaler_inf)
+            pred_key = max(scores_inf, key=scores_inf.get)
+            gen_answers.append(opts[pred_key])
+
+        gen_a_metrics = evaluate_answer_generation(sample_df, gen_answers)
+        print(f"  Answer Verification (generated vs. correct option text):")
+        print(f"     BLEU-1={gen_a_metrics['bleu_1']:.4f}  BLEU-2={gen_a_metrics['bleu_2']:.4f}"
+              f"  BLEU-4={gen_a_metrics['bleu_4']:.4f}  BLEU-avg={gen_a_metrics['bleu_avg']:.4f}")
+        print(f"     ROUGE-1={gen_a_metrics['rouge_1_f1']:.4f}  ROUGE-2={gen_a_metrics['rouge_2_f1']:.4f}"
+              f"  ROUGE-L={gen_a_metrics['rouge_l_f1']:.4f}")
+        print(f"     METEOR={gen_a_metrics['meteor']:.4f}")
+
+    except Exception as e:
+        print(f"  [WARN] Generation metrics skipped: {e}")
+
     print("\n" + "="*60)
     print("  Evaluation complete.")
     print("="*60 + "\n")
 
-    # ── Generate PDF report ───────────────────────────────────────────────────
     pdf_data = {
         "results_a":      results_a,
         "best_name":      best_name if results_a else "N/A",
@@ -791,6 +1199,8 @@ if __name__ == "__main__":
         "ls_metrics":     ls_metrics,
         "dist_metrics":   dist_metrics,
         "hint_metrics":   hint_metrics,
+        "gen_q_metrics":  gen_q_metrics,
+        "gen_a_metrics":  gen_a_metrics,
         "dataset_info": {
             "train_rows":   int(X_bin_tr.shape[0] // 4),
             "val_rows":     int(X_bin_va.shape[0] // 4),

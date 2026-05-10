@@ -154,12 +154,14 @@ def build_tfidf_features(train_bin, val_bin, test_bin):
 
 
 def build_dense_features(bin_df: pd.DataFrame, tfidf_vec,
-                         desc: str = "") -> np.ndarray:
+                         desc: str = "", verbose: bool = True) -> np.ndarray:
     """
     Build (N, 8) dense feature matrix for a binary-expanded DataFrame.
     Fully vectorised — no Python row loop.
+    Set verbose=False to suppress progress prints (e.g. during inference).
     """
-    print(f"  Dense features [{desc}]: vectorising {len(bin_df):,} rows …")
+    if verbose:
+        print(f"  Dense features [{desc}]: vectorising {len(bin_df):,} rows …")
 
     articles  = bin_df["article"].tolist()
     questions = bin_df["question"].tolist()
@@ -181,7 +183,8 @@ def build_dense_features(bin_df: pd.DataFrame, tfidf_vec,
     q_art_overlap   = word_overlap(articles,  questions)
 
     # ── TF-IDF cosine similarities (batch transform) ──────────────────────────
-    print(f"    TF-IDF transforms …")
+    if verbose:
+        print(f"    TF-IDF transforms …")
     BATCH = 10000   # transform in chunks to avoid peak memory spike
 
     def batch_cosine(list_a, list_b):
@@ -205,7 +208,8 @@ def build_dense_features(bin_df: pd.DataFrame, tfidf_vec,
         opt_art_overlap, opt_q_overlap, q_art_overlap,
         sim_art_opt, sim_q_opt,
     ])
-    print(f"    Done — shape {dense.shape}")
+    if verbose:
+        print(f"    Done — shape {dense.shape}")
     return dense
 
 
